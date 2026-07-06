@@ -5,38 +5,36 @@ from collections import defaultdict
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
 # ── Assigned values ──
 ASSIGNED_ORIGIN = "https://app-08d5ki.example.com"
-RATE_LIMIT = 10          # requests per window
-WINDOW_SECONDS = 10        # seconds
+RATE_LIMIT = 10
+WINDOW_SECONDS = 10
 
-# Optional: set EXAM_ORIGIN env var if the exam page origin differs from the assigned one
+# Build allowlist: assigned origin + exam page origin (from env var)
+EXAM_ORIGIN = os.getenv("EXAM_ORIGIN", "")
 ALLOWED_ORIGINS = [ASSIGNED_ORIGIN]
-_exam_origin = os.getenv("EXAM_ORIGIN")
-if _exam_origin:
-    ALLOWED_ORIGINS.append(_exam_origin)
-
-# ── In-memory rate-limit buckets: client_id -> {start, count} ──
-buckets = defaultdict(lambda: {"start": 0.0, "count": 0})
+if EXAM_ORIGIN:
+    ALLOWED_ORIGINS.append(EXAM_ORIGIN)
 
 # ── Middleware 1: Request Context (innermost) ──
 @app.middleware("http")
 async def request_context_middleware(request: Request, call_next):
-    # Reuse inbound X-Request-ID or generate a fresh UUID4
     request_id = request.headers.get("X-Request-ID")
     if not request_id:
         request_id = str(uuid.uuid4())
     request.state.request_id = request_id
 
     response = await call_next(request)
-    # Propagate back in response header
     response.headers["X-Request-ID"] = request_id
     return response
 
 # ── Middleware 2: Per-Client Rate Limiting ──
+buckets = defaultdict(lambda: {"start": 0.0, "count": 0})
+
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     if request.method == "OPTIONS":
@@ -46,7 +44,6 @@ async def rate_limit_middleware(request: Request, call_next):
     now = time.time()
     bucket = buckets[client_id]
 
-    # Fixed-window reset
     if now - bucket["start"] >= WINDOW_SECONDS:
         bucket["start"] = now
         bucket["count"] = 1
@@ -62,32 +59,16 @@ async def rate_limit_middleware(request: Request, call_next):
 
     return await call_next(request)
 
-# ── Middleware 3: Scoped CORS (outermost) ──
-@app.middleware("http")
-async def cors_middleware(request: Request, call_next):
-    origin = request.headers.get("Origin")
-
-    # Preflight handling
-    if request.method == "OPTIONS":
-        response = JSONResponse(content={})
-        if origin in ALLOWED_ORIGINS:
-            response.headers["Access-Control-Allow-Origin"] = origin
-            response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
-            response.headers["Access-Control-Allow-Headers"] = "X-Request-ID, X-Client-Id, Content-Type"
-            response.headers["Access-Control-Expose-Headers"] = "X-Request-ID"
-            response.headers["Access-Control-Max-Age"] = "86400"
-            response.headers["Vary"] = "Origin"
-        return response
-
-    response = await call_next(request)
-
-    if origin in ALLOWED_ORIGINS:
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Access-Control-Expose-Headers"] = "X-Request-ID"
-        response.headers["Vary"] = "Origin"
-
-    return response
+# ── Middleware 3: CORS (outermost) ──
+# Using FastAPI's built-in CORSMiddleware is more reliable than raw ASGI
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "OPTIONS"],
+    allow_headers=["X-Request-ID", "X-Client-Id", "Content-Type"],
+    expose_headers=["X-Request-ID"],
+)
 
 # ── Endpoint ──
 @app.get("/ping")
